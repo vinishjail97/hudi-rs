@@ -304,6 +304,27 @@ impl Storage {
         Ok(concat_batches(&schema, &batches)?)
     }
 
+    /// Read a Parquet file with column projection via [ParquetReadOptions].
+    ///
+    /// This is the non-streaming equivalent of [get_parquet_file_stream] —
+    /// it collects all batches into a single [RecordBatch].
+    pub async fn get_parquet_file_data_with_options(
+        &self,
+        relative_path: &str,
+        options: ParquetReadOptions,
+    ) -> Result<RecordBatch> {
+        let mut file_stream = self.get_parquet_file_stream(relative_path, options).await?;
+        let schema = file_stream.schema.clone();
+        let mut batches = Vec::new();
+        while let Some(r) = file_stream.stream.next().await {
+            batches.push(r?)
+        }
+        if batches.is_empty() {
+            return Ok(RecordBatch::new_empty(schema));
+        }
+        Ok(concat_batches(&schema, &batches)?)
+    }
+
     /// Get a streaming reader for a Parquet file.
     ///
     /// Returns a [ParquetFileStream] that yields record batches as they are read,
@@ -334,8 +355,8 @@ impl Storage {
 
         // Handle projection: convert column names to indices using builder's schema
         if let Some(ref column_names) = options.projection {
-            let arrow_schema = builder.schema();
-            let file_cols: Vec<&str> = arrow_schema
+            let full_schema = builder.schema().clone();
+            let file_cols: Vec<&str> = full_schema
                 .fields()
                 .iter()
                 .map(|f| f.name().as_str())
@@ -360,8 +381,8 @@ impl Storage {
             let projection: Vec<usize> = column_names
                 .iter()
                 .map(|name| {
-                    arrow_schema.index_of(name).map_err(|_| {
-                        let available = arrow_schema
+                    full_schema.index_of(name).map_err(|_| {
+                        let available = full_schema
                             .fields()
                             .iter()
                             .map(|f| f.name().as_str())
@@ -374,11 +395,28 @@ impl Storage {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
+            // Build projected schema preserving parquet file's column order
+            // (not caller's order) because the stream yields columns in file order.
+            let projected_schema = Arc::new(arrow_schema::Schema::new(
+                full_schema
+                    .fields()
+                    .iter()
+                    .filter(|f| column_names.iter().any(|n| n == f.name()))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ));
+
             let projection_mask = parquet::arrow::ProjectionMask::roots(
                 builder.parquet_schema(),
                 projection.iter().copied(),
             );
             builder = builder.with_projection(projection_mask);
+
+            let stream = builder.build()?;
+            return Ok(ParquetFileStream {
+                schema: projected_schema,
+                stream: Box::pin(stream),
+            });
         } else {
             let arrow_schema = builder.schema();
             let all_cols: Vec<&str> = arrow_schema
