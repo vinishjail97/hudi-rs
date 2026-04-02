@@ -63,6 +63,10 @@ impl<R: Read> Iterator for AvroDataBlockContentReader<R> {
 
         let result = from_avro_datum(&self.writer_schema, &mut record_reader, None);
 
+        // Drain any bytes not consumed by from_avro_datum so the next record
+        // read starts at the correct position.
+        std::io::copy(&mut record_reader, &mut std::io::sink()).ok();
+
         Some(result)
     }
 }

@@ -64,25 +64,30 @@ impl Decoder {
             fallback_length
         };
 
-        let reader = reader.by_ref().take(content_length);
-        match block_type {
+        let mut reader = reader.by_ref().take(content_length);
+        let result = match block_type {
             BlockType::AvroData => self
-                .decode_avro_record_content(reader, header)
+                .decode_avro_record_content(reader.by_ref(), header)
                 .map(LogBlockContent::Records),
             BlockType::ParquetData => self
-                .decode_parquet_record_content(reader)
+                .decode_parquet_record_content(reader.by_ref())
                 .map(LogBlockContent::Records),
             BlockType::Delete => self
-                .decode_delete_record_content(reader, header)
+                .decode_delete_record_content(reader.by_ref(), header)
                 .map(LogBlockContent::Records),
             BlockType::HfileData => self
-                .decode_hfile_record_content(reader)
+                .decode_hfile_record_content(reader.by_ref())
                 .map(LogBlockContent::HFileRecords),
             BlockType::Command => Ok(LogBlockContent::Empty),
             _ => Err(CoreError::LogBlockError(format!(
                 "Unsupported block type: {block_type:?}"
             ))),
-        }
+        };
+        // Drain any unconsumed bytes from the content-length bounded reader
+        // so the underlying stream is positioned at the end of the block content.
+        // Without this, leftover padding or trailing bytes corrupt subsequent reads.
+        std::io::copy(&mut reader, &mut std::io::sink()).ok();
+        result
     }
 
     /// Validate the log block version (first 4 bytes of block content).
@@ -163,6 +168,10 @@ impl Decoder {
         let delete_record_list =
             from_avro_datum(del_list_schema, delete_records_reader.by_ref(), None)
                 .map_err(CoreError::AvroError)?;
+
+        // Drain any bytes not consumed by from_avro_datum so the outer bounded
+        // reader's position is at the end of the delete block content.
+        std::io::copy(&mut delete_records_reader, &mut std::io::sink()).ok();
 
         // Extract delete records from the parsed Avro value
         let delete_records = {
@@ -391,6 +400,117 @@ mod tests {
         let batches = decoder.decode_parquet_record_content(&mut reader)?;
         assert_eq!(batches.num_data_batches(), 1);
         assert_eq!(batches.num_data_rows(), 3);
+
+        Ok(())
+    }
+
+    /// Demonstrates the AVRO delete block drain bug: after decoding a delete block,
+    /// leftover bytes inside the delete_records_reader are not consumed. This leaves
+    /// the outer reader at the wrong position, corrupting subsequent block reads.
+    ///
+    /// We construct a delete block whose content is:
+    ///   [4 bytes: log block version (V3 = 0x00000003)]
+    ///   [4 bytes: delete_records_num_bytes (= avro_len + PADDING)]
+    ///   [avro_len bytes: avro datum for HoodieDeleteRecordList]
+    ///   [PADDING bytes: extra trailing bytes]
+    ///   [1 byte: sentinel 0xAB after the content]
+    ///
+    /// decode_content is called with content_length = 4 + 4 + avro_len + PADDING.
+    /// After decoding, the reader should be exactly at the sentinel byte.
+    /// Without the drain fix, the reader is PADDING bytes short.
+    #[test]
+    fn test_delete_block_without_drain_corrupts_reader_position() -> Result<()> {
+        use apache_avro::{to_avro_datum, types::Value as AvroValue};
+        use std::io::Seek;
+
+        // Build a minimal HoodieDeleteRecordList avro datum
+        let del_list_schema = avro_schema_for_delete_record_list()?;
+        let delete_record = AvroValue::Record(vec![
+            (
+                "recordKey".to_string(),
+                AvroValue::Union(1, Box::new(AvroValue::String("key1".to_string()))),
+            ),
+            (
+                "partitionPath".to_string(),
+                AvroValue::Union(1, Box::new(AvroValue::String("path1".to_string()))),
+            ),
+            (
+                "orderingVal".to_string(),
+                AvroValue::Union(1, Box::new(AvroValue::Int(42))),
+            ),
+        ]);
+        let delete_list_value = AvroValue::Record(vec![(
+            "deleteRecordList".to_string(),
+            AvroValue::Array(vec![delete_record]),
+        )]);
+        let avro_bytes = to_avro_datum(del_list_schema, delete_list_value)?;
+        let avro_len = avro_bytes.len() as u32;
+
+        // Add 7 bytes of padding to simulate leftover bytes in the delete block
+        let padding: u32 = 7;
+        let delete_records_num_bytes = avro_len + padding;
+
+        // Build content: [version(4)] [delete_records_num_bytes(4)] [avro] [padding]
+        let mut content = Vec::new();
+        content.extend_from_slice(&3u32.to_be_bytes()); // log block version V3
+        content.extend_from_slice(&delete_records_num_bytes.to_be_bytes());
+        content.extend_from_slice(&avro_bytes);
+        content.extend_from_slice(&vec![0xFFu8; padding as usize]); // padding bytes
+
+        let content_length = content.len() as u64;
+
+        // Append a sentinel byte AFTER the content
+        let mut full_buf = Vec::new();
+        // content_length as 8-byte BE (for LogFormatVersion that has_content_length)
+        full_buf.extend_from_slice(&content_length.to_be_bytes());
+        full_buf.extend_from_slice(&content);
+        full_buf.push(0xAB); // sentinel
+
+        let mut reader = Cursor::new(full_buf.clone());
+
+        let hudi_configs = HudiConfigs::empty();
+        let decoder = Decoder::new(Arc::new(hudi_configs));
+
+        // Use a LogFormatVersion that has content_length (version >= 3)
+        let format_version = LogFormatVersion::V1;
+        let mut header = HashMap::new();
+        header.insert(
+            BlockMetadataKey::InstantTime,
+            "20240101000000".to_string(),
+        );
+
+        let _result = decoder.decode_content(
+            &mut reader,
+            &format_version,
+            0,
+            &BlockType::Delete,
+            &header,
+        )?;
+
+        // After decode_content, the reader should be positioned right after
+        // the content (at the sentinel byte). The content_length (8 bytes)
+        // + content bytes should all be consumed.
+        let expected_pos = 8 + content_length;
+        let actual_pos = reader.stream_position().unwrap();
+
+        // BUG: Without the drain fix, actual_pos < expected_pos because the
+        // padding bytes were not consumed by from_avro_datum and were not drained.
+        // The reader is `padding` bytes short of where it should be.
+        assert_eq!(
+            actual_pos, expected_pos,
+            "Reader position after decode_content is wrong: \
+             expected {} (8 + {content_length}) but got {actual_pos}. \
+             The delete block decoder did not consume all content bytes, \
+             leaving the stream {diff} bytes short. This will corrupt \
+             subsequent block reads.",
+            expected_pos,
+            diff = expected_pos - actual_pos,
+        );
+
+        // Verify the sentinel byte is at the current position
+        let mut sentinel = [0u8; 1];
+        reader.read_exact(&mut sentinel).unwrap();
+        assert_eq!(sentinel[0], 0xAB, "Sentinel byte mismatch");
 
         Ok(())
     }
