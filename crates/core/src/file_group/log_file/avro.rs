@@ -25,6 +25,7 @@ pub struct AvroDataBlockContentReader<R: Read> {
     reader: R,
     writer_schema: AvroSchema,
     remaining_records: u32,
+    total_records: u32,
 }
 
 impl<R: Read> AvroDataBlockContentReader<R> {
@@ -33,6 +34,7 @@ impl<R: Read> AvroDataBlockContentReader<R> {
             reader,
             writer_schema: writer_schema.clone(),
             remaining_records: num_records,
+            total_records: num_records,
         }
     }
 }
@@ -59,9 +61,19 @@ impl<R: Read> Iterator for AvroDataBlockContentReader<R> {
 
         let record_content_length = u32::from_be_bytes(record_content_length);
 
+        let record_idx = self.total_records - self.remaining_records - 1;
+        log::debug!(
+            "AvroDataBlockContentReader: record {}/{} content_length={} bytes",
+            record_idx, self.total_records, record_content_length
+        );
+
         let mut record_reader = (&mut self.reader).take(record_content_length as u64);
 
         let result = from_avro_datum(&self.writer_schema, &mut record_reader, None);
+
+        // Drain any bytes not consumed by from_avro_datum so the next record
+        // read starts at the correct position.
+        std::io::copy(&mut record_reader, &mut std::io::sink()).ok();
 
         Some(result)
     }

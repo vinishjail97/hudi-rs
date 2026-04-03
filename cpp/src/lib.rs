@@ -29,10 +29,15 @@ static LOGGER: OnceLock<()> = OnceLock::new();
 
 /// Initialize env_logger exactly once for the lifetime of the loaded shared library.
 ///
-/// Reads RUST_LOG from the environment at the time the first FileGroupReader is created.
-/// Example: RUST_LOG=hudi_core=debug enables all hudi-core debug logs.
+/// Always enables hudi_core=debug logging. If RUST_LOG is already set, it is
+/// respected (and hudi_core=debug is appended if not already present).
 fn init_logger() {
     LOGGER.get_or_init(|| {
+        match std::env::var("RUST_LOG") {
+            Ok(val) if val.contains("hudi_core") => {}
+            Ok(val) => unsafe { std::env::set_var("RUST_LOG", format!("{val},hudi_core=debug")) },
+            Err(_) => unsafe { std::env::set_var("RUST_LOG", "hudi_core=debug") },
+        }
         let _ = env_logger::try_init();
     });
 }
