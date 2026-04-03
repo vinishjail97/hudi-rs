@@ -412,6 +412,74 @@ mod tests {
         );
     }
 
+    /// ENG-39781: When no precombine/ordering field is present, the merger
+    /// defaults to AppendOnly (no dedup). With 3 base rows + 3 upsert log
+    /// rows sharing the same keys, AppendOnly returns all 6 rows instead of
+    /// deduplicating to 3 by commit time.
+    #[test]
+    fn test_no_precombine_field_uses_append_only_no_dedup() {
+        let schema = create_test_schema(false);
+
+        // Base batch: 3 rows at commit c1
+        let base_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["c1", "c1", "c1"])),
+                Arc::new(StringArray::from(vec!["c1_s1_0", "c1_s1_1", "c1_s1_2"])),
+                Arc::new(StringArray::from(vec!["k1", "k2", "k3"])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        // Log batch: 3 upsert rows with SAME keys at commit c2 (newer)
+        let log_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["c2", "c2", "c2"])),
+                Arc::new(StringArray::from(vec!["c2_s2_0", "c2_s2_1", "c2_s2_2"])),
+                Arc::new(StringArray::from(vec!["k1", "k2", "k3"])),
+                Arc::new(Int32Array::from(vec![4, 5, 6])),
+                Arc::new(Int32Array::from(vec![100, 200, 300])),
+            ],
+        )
+        .unwrap();
+
+        // No precombine field → derives AppendOnly
+        let configs = HudiConfigs::new([(PopulatesMetaFields, "true")]);
+        let strategy: String = configs.get_or_default(RecordMergeStrategy).into();
+        assert_eq!(strategy, "append_only");
+
+        let merger = RecordMerger::new(schema.clone(), Arc::new(configs));
+        let batches = RecordBatches::new_with_data_batches([base_batch.clone(), log_batch.clone()]);
+        let merged = merger.merge_record_batches(batches).unwrap();
+
+        // AppendOnly returns all 6 rows — no dedup by record key
+        assert_eq!(merged.num_rows(), 6);
+
+        // Explicitly set commit_time_ordering with a precombine field present.
+        // This should dedup to 3 rows keeping the latest commit (c2) for each key.
+        let configs = create_configs("COMMIT_TIME_ORDERING", true, Some("ts"));
+
+        // Verify the strategy is actually recognized as commit_time_ordering,
+        // not silently falling back to overwrite_with_latest.
+        let strategy: String = configs.get_or_default(RecordMergeStrategy).into();
+        assert_eq!(
+            strategy, "commit_time_ordering",
+            "Strategy should be commit_time_ordering, not a fallback"
+        );
+
+        let merger = RecordMerger::new(schema.clone(), Arc::new(configs));
+        let batches = RecordBatches::new_with_data_batches([base_batch, log_batch]);
+        let merged = merger.merge_record_batches(batches).unwrap();
+        assert_eq!(
+            merged.num_rows(),
+            3,
+            "commit_time_ordering should dedup to 3 rows (one per key, latest commit wins)"
+        );
+    }
+
     #[test]
     fn test_merge_records_overwrite_with_latest() {
         let schema = create_test_schema(false);

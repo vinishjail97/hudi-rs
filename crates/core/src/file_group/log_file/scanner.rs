@@ -146,10 +146,12 @@ impl LogFileScanner {
         let mut all_blocks: Vec<Vec<LogBlock>> = Vec::with_capacity(relative_paths.len());
         let mut rollback_targets: HashSet<String> = HashSet::new();
 
-        for path in relative_paths {
+        for (i, path) in relative_paths.iter().enumerate() {
+            log::debug!("LogFileScanner: scanning log file {}/{}: '{}'", i + 1, relative_paths.len(), path);
             let mut reader =
-                LogFileReader::new(self.hudi_configs.clone(), self.storage.clone(), &path).await?;
+                LogFileReader::new(self.hudi_configs.clone(), self.storage.clone(), path).await?;
             let blocks = reader.read_all_blocks(instant_range)?;
+            log::debug!("LogFileScanner: log file '{}' produced {} blocks", path, blocks.len());
 
             // Collect rollback targets from command blocks
             for block in &blocks {

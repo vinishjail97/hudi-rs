@@ -162,16 +162,65 @@ impl Decoder {
         reader.read_exact(&mut delete_records_num_bytes)?;
         let delete_records_num_bytes = u32::from_be_bytes(delete_records_num_bytes);
 
-        // Read and parse delete keys as Avro
-        let mut delete_records_reader = reader.take(delete_records_num_bytes as u64);
-        let del_list_schema = avro_schema_for_delete_record_list()?;
-        let delete_record_list =
-            from_avro_datum(del_list_schema, delete_records_reader.by_ref(), None)
-                .map_err(CoreError::AvroError)?;
+        log::debug!(
+            "decode_delete_record_content: delete_records_num_bytes={}, header={:?}",
+            delete_records_num_bytes,
+            header
+        );
 
-        // Drain any bytes not consumed by from_avro_datum so the outer bounded
-        // reader's position is at the end of the delete block content.
-        std::io::copy(&mut delete_records_reader, &mut std::io::sink()).ok();
+        // Peek at the first few bytes to understand the binary structure
+        let mut peek_buf = Vec::new();
+        let mut delete_records_reader = reader.take(delete_records_num_bytes as u64);
+        delete_records_reader.read_to_end(&mut peek_buf).ok();
+        log::debug!(
+            "decode_delete_record_content: raw bytes ({} bytes): {:02x?}",
+            peek_buf.len(),
+            &peek_buf[..std::cmp::min(peek_buf.len(), 120)]
+        );
+
+        // Now parse from the buffered bytes
+        let mut cursor = std::io::Cursor::new(&peek_buf);
+        let del_list_schema = avro_schema_for_delete_record_list()?;
+        log::debug!(
+            "decode_delete_record_content: using schema with orderingVal union variants={}",
+            match del_list_schema {
+                apache_avro::Schema::Record(r) => {
+                    match &r.fields[0].schema {
+                        apache_avro::Schema::Array(a) => {
+                            match a.items.as_ref() {
+                                apache_avro::Schema::Record(inner) => {
+                                    match &inner.fields[2].schema {
+                                        apache_avro::Schema::Union(u) => u.variants().len(),
+                                        _ => 0,
+                                    }
+                                }
+                                _ => 0,
+                            }
+                        }
+                        _ => 0,
+                    }
+                }
+                _ => 0,
+            }
+        );
+        let delete_record_list = match from_avro_datum(del_list_schema, &mut cursor, None) {
+            Ok(v) => {
+                log::debug!(
+                    "decode_delete_record_content: from_avro_datum OK, cursor pos={}/{}",
+                    cursor.position(), peek_buf.len()
+                );
+                v
+            }
+            Err(e) => {
+                log::error!(
+                    "decode_delete_record_content: from_avro_datum FAILED at cursor pos={}/{}: {}",
+                    cursor.position(), peek_buf.len(), e
+                );
+                return Err(CoreError::AvroError(e));
+            }
+        };
+
+        // delete_records_reader already fully consumed into peek_buf above
 
         // Extract delete records from the parsed Avro value
         let delete_records = {

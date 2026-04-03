@@ -228,6 +228,11 @@ impl<R: Read + Seek> LogFileReader<R> {
         let format_version = self.read_log_format_version()?;
         let block_type = self.read_block_type(&format_version)?;
         let header = self.read_block_metadata(BlockMetadataType::Header, &format_version)?;
+        log::debug!(
+            "LogFileReader: block at pos={} length={} type={:?} version={:?} instant={:?}",
+            curr_pos, block_length, block_type, format_version,
+            header.get(&BlockMetadataKey::InstantTime)
+        );
         // If block is out of the requested range, fast skip its payload without decoding
         if self.should_skip_block(&header, instant_range)? {
             // block_length excludes the magic; we consumed 8 bytes of length already.
