@@ -171,7 +171,7 @@ pub(crate) fn sanitize_avro_schema_str(avro_schema_str: &str) -> String {
     avro_schema_str.trim().replace("\\:", ":")
 }
 
-fn arrow_schema_from_avro_schema_str(avro_schema_str: &str) -> Result<Schema> {
+pub(crate) fn arrow_schema_from_avro_schema_str(avro_schema_str: &str) -> Result<Schema> {
     let s = sanitize_avro_schema_str(avro_schema_str);
     let avro_schema = AvroSchema::parse_str(&s)
         .map_err(|e| CoreError::Schema(format!("Failed to parse Avro schema: {e}")))?;

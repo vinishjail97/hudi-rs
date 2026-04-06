@@ -316,20 +316,26 @@ impl ConfigParser for HudiTableConfig {
                         );
                     }
 
-                    if !configs.contains_key(HudiTableConfig::PrecombineField.as_ref())
-                        && !configs.contains_key("hoodie.table.ordering.fields")
-                    {
-                        // When precombine/ordering field is not available, we treat the table as append-only
-                        return HudiConfigValue::String(
-                            RecordMergeStrategyValue::AppendOnly.as_ref().to_string(),
-                        );
-                    }
+                    let has_ordering_field = {
+                        let precombine = configs.get(HudiTableConfig::PrecombineField.as_ref());
+                        let ordering = configs.get("hoodie.table.ordering.fields");
+                        matches!(precombine, Some(v) if !v.is_empty())
+                            || matches!(ordering, Some(v) if !v.is_empty())
+                    };
 
-                    HudiConfigValue::String(
-                        RecordMergeStrategyValue::OverwriteWithLatest
-                            .as_ref()
-                            .to_string(),
-                    )
+                    if has_ordering_field {
+                        HudiConfigValue::String(
+                            RecordMergeStrategyValue::OverwriteWithLatest
+                                .as_ref()
+                                .to_string(),
+                        )
+                    } else {
+                        // No precombine/ordering field: use commit-time ordering — dedup by key
+                        // using commit sequence number, mirroring Hudi Java's COMMIT_TIME_ORDERING.
+                        HudiConfigValue::String(
+                            RecordMergeStrategyValue::CommitTimeOrdering.as_ref().to_string(),
+                        )
+                    }
                 }
                 _ => self
                     .default_value()
@@ -572,8 +578,8 @@ mod tests {
             .into();
         assert_eq!(
             actual,
-            RecordMergeStrategyValue::AppendOnly.as_ref(),
-            "Should derive as append-only due to missing precombine field"
+            RecordMergeStrategyValue::CommitTimeOrdering.as_ref(),
+            "Should derive as commit_time_ordering when no precombine field is set"
         );
 
         let hudi_configs = HudiConfigs::new(vec![

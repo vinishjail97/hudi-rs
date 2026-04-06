@@ -164,6 +164,10 @@ impl Decoder {
             from_avro_datum(del_list_schema, delete_records_reader.by_ref(), None)
                 .map_err(CoreError::AvroError)?;
 
+        // Drain any bytes not consumed by from_avro_datum so the outer bounded reader's
+        // position is always at the end of the delete block content (same pattern as avro.rs:68).
+        std::io::copy(&mut delete_records_reader, &mut std::io::sink()).ok();
+
         // Extract delete records from the parsed Avro value
         let delete_records = {
             let fields = match delete_record_list {

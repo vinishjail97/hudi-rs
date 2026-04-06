@@ -29,10 +29,15 @@ static LOGGER: OnceLock<()> = OnceLock::new();
 
 /// Initialize env_logger exactly once for the lifetime of the loaded shared library.
 ///
-/// Reads RUST_LOG from the environment at the time the first FileGroupReader is created.
-/// Example: RUST_LOG=hudi_core=debug enables all hudi-core debug logs.
+/// Always enables hudi_core=debug logging. If RUST_LOG is already set, it is
+/// respected (and hudi_core=debug is appended if not already present).
 fn init_logger() {
     LOGGER.get_or_init(|| {
+        match std::env::var("RUST_LOG") {
+            Ok(val) if val.contains("hudi_core") => {}
+            Ok(val) => unsafe { std::env::set_var("RUST_LOG", format!("{val},hudi_core=debug")) },
+            Err(_) => unsafe { std::env::set_var("RUST_LOG", "hudi_core=debug") },
+        }
         let _ = env_logger::try_init();
     });
 }
@@ -168,11 +173,18 @@ pub fn new_file_slice_from_file_names(
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    let mut file_group = FileGroup::new_with_base_file_name(base_file_name, partition_path)
-        .map_err(|e| format!("Failed to create FileGroup: {e}"))?;
-    file_group
-        .add_log_files_from_names(&log_file_names)
-        .map_err(|e| format!("Failed to add files to FileGroup: {e}"))?;
+    let file_group = if base_file_name.is_empty() {
+        // Log-only split: MOR file group has log files but no base Parquet file yet
+        // (before the first compaction). Parse the file group id from the log file names.
+        FileGroup::new_from_log_file_names(&log_file_names, partition_path)
+            .map_err(|e| format!("Failed to create FileGroup: {e}"))?
+    } else {
+        let mut fg = FileGroup::new_with_base_file_name(base_file_name, partition_path)
+            .map_err(|e| format!("Failed to create FileGroup: {e}"))?;
+        fg.add_log_files_from_names(&log_file_names)
+            .map_err(|e| format!("Failed to add files to FileGroup: {e}"))?;
+        fg
+    };
 
     let (_, file_slice) = file_group
         .file_slices

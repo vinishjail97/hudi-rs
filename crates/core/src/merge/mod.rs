@@ -30,6 +30,10 @@ use strum_macros::AsRefStr;
 pub enum RecordMergeStrategyValue {
     #[strum(serialize = "append_only")]
     AppendOnly,
+    /// Dedup by record key using commit time only — no precombine/ordering field required.
+    /// Mirrors Hudi Java's COMMIT_TIME_ORDERING merge mode.
+    #[strum(serialize = "commit_time_ordering")]
+    CommitTimeOrdering,
     #[strum(serialize = "overwrite_with_latest")]
     OverwriteWithLatest,
 }
@@ -40,6 +44,7 @@ impl FromStr for RecordMergeStrategyValue {
     fn from_str(s: &str) -> error::Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "append_only" => Ok(Self::AppendOnly),
+            "commit_time_ordering" => Ok(Self::CommitTimeOrdering),
             "overwrite_with_latest" => Ok(Self::OverwriteWithLatest),
             v => Err(InvalidValue(v.to_string())),
         }

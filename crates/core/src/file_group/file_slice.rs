@@ -27,20 +27,27 @@ use std::fmt::Display;
 use std::path::PathBuf;
 
 /// Within a [crate::file_group::FileGroup],
-/// a [FileSlice] is a logical group of [BaseFile] and [LogFile]s.
+/// a [FileSlice] is a logical group of an optional [BaseFile] and [LogFile]s.
+///
+/// A log-only [FileSlice] (`base_file = None`) represents a file group that has
+/// delta log files but no base Parquet file yet (i.e., before the first compaction).
 #[derive(Clone, Debug)]
 pub struct FileSlice {
-    pub base_file: BaseFile,
+    pub base_file: Option<BaseFile>,
     pub log_files: BTreeSet<LogFile>,
     pub partition_path: String,
 }
 
 impl Display for FileSlice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let base = match &self.base_file {
+            Some(bf) => bf.to_string(),
+            None => "<log-only>".to_string(),
+        };
         write!(
             f,
             "FileSlice {{ base_file: {}, log_files: {:?}, partition_path: {} }}",
-            self.base_file, self.log_files, self.partition_path
+            base, self.log_files, self.partition_path
         )
     }
 }
@@ -56,7 +63,19 @@ impl Eq for FileSlice {}
 impl FileSlice {
     pub fn new(base_file: BaseFile, partition_path: String) -> Self {
         Self {
-            base_file,
+            base_file: Some(base_file),
+            log_files: BTreeSet::new(),
+            partition_path,
+        }
+    }
+
+    /// Create a log-only [FileSlice] with no base file.
+    ///
+    /// Used for file groups that have delta log files but no base Parquet file yet
+    /// (i.e., before the first compaction).
+    pub fn new_log_only(partition_path: String) -> Self {
+        Self {
+            base_file: None,
             log_files: BTreeSet::new(),
             partition_path,
         }
@@ -86,9 +105,13 @@ impl FileSlice {
     }
 
     /// Returns the relative path of the [BaseFile] in the [FileSlice].
+    ///
+    /// Returns an empty string for log-only slices (no base file).
     pub fn base_file_relative_path(&self) -> Result<String> {
-        let file_name = &self.base_file.file_name();
-        self.relative_path_for_file(file_name)
+        match &self.base_file {
+            Some(bf) => self.relative_path_for_file(&bf.file_name()),
+            None => Ok(String::new()),
+        }
     }
 
     /// Returns the relative path of the given [LogFile] in the [FileSlice].
@@ -98,17 +121,31 @@ impl FileSlice {
     }
 
     /// Returns the enclosing [FileGroup]'s id.
+    ///
+    /// For log-only slices (no base file), the id is derived from the first log file.
     #[inline]
     pub fn file_id(&self) -> &str {
-        &self.base_file.file_id
+        match &self.base_file {
+            Some(bf) => &bf.file_id,
+            None => self
+                .log_files
+                .iter()
+                .next()
+                .map(|lf| lf.file_id.as_str())
+                .unwrap_or(""),
+        }
     }
 
     /// Returns the instant time that marks the [FileSlice] creation.
     ///
     /// This is also an instant time stored in the [Timeline].
+    /// For log-only slices (no base file), returns an empty string.
     #[inline]
     pub fn creation_instant_time(&self) -> &str {
-        &self.base_file.commit_timestamp
+        match &self.base_file {
+            Some(bf) => &bf.commit_timestamp,
+            None => "",
+        }
     }
 
     /// Load [FileMetadata] from storage layer for the [BaseFile] if `file_metadata` is [None]
@@ -116,14 +153,20 @@ impl FileSlice {
     ///
     /// This only loads metadata for Parquet files. For non-Parquet files (e.g., HFile),
     /// this is a no-op since Parquet-specific metadata reading would fail.
+    /// For log-only slices (no base file), this is a no-op.
     /// TODO: see if mdt read would benefit from loading hfile metadata as well.
     pub async fn load_metadata_if_needed(&mut self, storage: &Storage) -> Result<()> {
+        let base_file = match &self.base_file {
+            Some(bf) => bf,
+            None => return Ok(()), // log-only: no base file to load metadata for
+        };
+
         // Skip non-Parquet files - metadata loading uses Parquet-specific APIs
-        if self.base_file.extension != BaseFileFormatValue::Parquet.as_ref() {
+        if base_file.extension != BaseFileFormatValue::Parquet.as_ref() {
             return Ok(());
         }
 
-        if let Some(metadata) = &self.base_file.file_metadata {
+        if let Some(metadata) = &base_file.file_metadata {
             if metadata.fully_populated {
                 return Ok(());
             }
@@ -131,7 +174,9 @@ impl FileSlice {
 
         let relative_path = self.base_file_relative_path()?;
         let fetched_metadata = storage.get_file_metadata(&relative_path).await?;
-        self.base_file.file_metadata = Some(fetched_metadata);
+        if let Some(bf) = &mut self.base_file {
+            bf.file_metadata = Some(fetched_metadata);
+        }
         Ok(())
     }
 }
@@ -167,13 +212,13 @@ mod tests {
         )?);
 
         let mut slice1 = FileSlice {
-            base_file: base.clone(),
+            base_file: Some(base.clone()),
             log_files: log_set1,
             partition_path: EMPTY_PARTITION_PATH.to_string(),
         };
 
         let slice2 = FileSlice {
-            base_file: base,
+            base_file: Some(base),
             log_files: log_set2,
             partition_path: EMPTY_PARTITION_PATH.to_string(),
         };
@@ -203,17 +248,17 @@ mod tests {
     #[test]
     fn test_merge_different_base_files() -> Result<()> {
         let mut slice1 = FileSlice {
-            base_file: BaseFile::from_str(
+            base_file: Some(BaseFile::from_str(
                 "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_0-7-24_20250109233025121.parquet",
-            )?,
+            )?),
             log_files: BTreeSet::new(),
             partition_path: EMPTY_PARTITION_PATH.to_string(),
         };
 
         let slice2 = FileSlice {
-            base_file: BaseFile::from_str(
+            base_file: Some(BaseFile::from_str(
                 "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_1-19-51_20250109233025121.parquet",
-            )?,
+            )?),
             log_files: BTreeSet::new(),
             partition_path: EMPTY_PARTITION_PATH.to_string(),
         };
@@ -230,13 +275,13 @@ mod tests {
             "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_1-19-51_20250109233025121.parquet",
         )?;
         let mut slice1 = FileSlice {
-            base_file: base.clone(),
+            base_file: Some(base.clone()),
             log_files: BTreeSet::new(),
             partition_path: "path/to/partition1".to_string(),
         };
 
         let slice2 = FileSlice {
-            base_file: base,
+            base_file: Some(base),
             log_files: BTreeSet::new(),
             partition_path: "path/to/partition2".to_string(),
         };
@@ -244,6 +289,22 @@ mod tests {
         // Should return error for different partition paths
         assert!(slice1.merge(&slice2).is_err());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_log_only_slice() -> Result<()> {
+        let mut slice = FileSlice::new_log_only("2023/01/01".to_string());
+        assert!(slice.base_file.is_none());
+        assert_eq!(slice.base_file_relative_path()?, "");
+        assert_eq!(slice.file_id(), "");
+        assert_eq!(slice.creation_instant_time(), "");
+
+        let log_file = LogFile::from_str(
+            ".29f30b41-a58c-47f7-b7d9-7bb980a027d2-0_20260401221751427.log.1_0-82-166",
+        )?;
+        slice.log_files.insert(log_file);
+        assert_eq!(slice.file_id(), "29f30b41-a58c-47f7-b7d9-7bb980a027d2-0");
         Ok(())
     }
 }

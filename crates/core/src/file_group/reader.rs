@@ -32,6 +32,9 @@ use crate::merge::record_merger::RecordMerger;
 use crate::metadata::merger::FilesPartitionMerger;
 use crate::metadata::meta_field::MetaField;
 use crate::metadata::table_record::FilesPartitionRecord;
+use crate::schema::prepend_meta_fields;
+use crate::schema::resolver::arrow_schema_from_avro_schema_str;
+use arrow_schema::Schema;
 use crate::storage::{ParquetReadOptions, Storage};
 use crate::table::ReadOptions;
 use crate::table::builder::OptionResolver;
@@ -116,11 +119,79 @@ impl FileGroupReader {
         relative_path: &str,
     ) -> Result<RecordBatch> {
         log::debug!("FileGroupReader: reading base file '{relative_path}' (non-streaming)");
-        let records: RecordBatch = self
-            .storage
-            .get_parquet_file_data(relative_path)
-            .map_err(|e| ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}")))
-            .await?;
+
+        // If the caller supplied output columns, extend them with the fields
+        // required for a correct MOR merge before projecting the parquet read.
+        let output_columns: Option<String> = self
+            .hudi_configs
+            .try_get(HudiReadConfig::OutputColumns)
+            .map(|v| v.into());
+
+        let records: RecordBatch = if let Some(ref cols_str) = output_columns {
+            let mut projection: Vec<String> = cols_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            // Always required for RecordMerger dedup / sort.
+            let merge_cols = [
+                MetaField::RecordKey.as_ref(),
+                MetaField::CommitSeqno.as_ref(),
+            ];
+            for col in &merge_cols {
+                if !projection.iter().any(|c| c == col) {
+                    projection.push(col.to_string());
+                }
+            }
+
+            // Ordering field (e.g. "ts") is needed for EVENT_TIME_ORDERING.
+            let ordering_field: Option<String> = self
+                .hudi_configs
+                .try_get(HudiTableConfig::PrecombineField)
+                .map(|v| v.into());
+            if let Some(ref of) = ordering_field {
+                if !projection.iter().any(|c| c == of) {
+                    projection.push(of.clone());
+                }
+            }
+
+            // _hoodie_commit_time is required by RecordMerger (create_commit_time_ordering_converter)
+            // whenever meta fields are present, regardless of time-travel mode.
+            let populates_meta_fields: bool = self
+                .hudi_configs
+                .get_or_default(HudiTableConfig::PopulatesMetaFields)
+                .into();
+            if populates_meta_fields {
+                let ct = MetaField::CommitTime.as_ref().to_string();
+                if !projection.iter().any(|c| c == &ct) {
+                    projection.push(ct);
+                }
+            }
+
+            log::debug!(
+                "FileGroupReader: projecting {n} cols for '{relative_path}': [{cols}]",
+                n = projection.len(),
+                cols = projection.join(", "),
+            );
+
+            self.storage
+                .get_parquet_file_data_with_options(
+                    relative_path,
+                    ParquetReadOptions::new().with_projection(projection),
+                )
+                .map_err(|e| {
+                    ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}"))
+                })
+                .await?
+        } else {
+            self.storage
+                .get_parquet_file_data(relative_path)
+                .map_err(|e| {
+                    ReadFileSliceError(format!("Failed to read path {relative_path}: {e:?}"))
+                })
+                .await?
+        };
 
         let populates_meta_fields: bool = self
             .hudi_configs
@@ -258,10 +329,172 @@ impl FileGroupReader {
                 }
             };
 
+            // Log-only file group: no base Parquet file exists yet (before first compaction).
+            // Return the merged log records directly without reading a base file.
+            if base_file_path.is_empty() {
+                log::debug!("FileGroupReader: log-only read (no base file)");
+
+                // Derive the authoritative schema from the table create schema so that
+                // log batches (AVRO-derived column ordering/types) are aligned to the
+                // Parquet-equivalent schema that Velox expects.
+                // Fall back to the first log batch schema when no create schema is available.
+                let schema = match self.hudi_configs.try_get(HudiTableConfig::CreateSchema) {
+                    Some(create_schema) => {
+                        let avro_schema_str: String = create_schema.into();
+                        let data_schema = arrow_schema_from_avro_schema_str(&avro_schema_str)?;
+                        let mut full_schema = prepend_meta_fields(Arc::new(data_schema))?;
+
+                        log::warn!(
+                            "FileGroupReader log-only: CreateSchema fields ({} cols): [{}]",
+                            full_schema.fields().len(),
+                            full_schema.fields().iter().map(|f| format!("{}:{}", f.name(), f.data_type())).collect::<Vec<_>>().join(", ")
+                        );
+
+                        // Hudi Java appends partition columns at the END of Parquet schemas,
+                        // regardless of where they appear in the AVRO/CreateSchema declaration.
+                        // Move them here so projection below matches Parquet column ordering.
+                        let partition_fields: Vec<String> = self
+                            .hudi_configs
+                            .get_or_default(HudiTableConfig::PartitionFields)
+                            .into();
+                        log::warn!("FileGroupReader log-only: partition_fields={:?}", partition_fields);
+                        if !partition_fields.is_empty() {
+                            let (part_f, other_f): (Vec<_>, Vec<_>) = full_schema
+                                .fields()
+                                .iter()
+                                .cloned()
+                                .partition(|f| partition_fields.contains(f.name()));
+                            if !part_f.is_empty() {
+                                let mut new_fields: Vec<_> = other_f;
+                                new_fields.extend(part_f);
+                                full_schema = Schema::new(new_fields);
+                            }
+                        }
+
+                        // Also append any extra AVRO fields not present in CreateSchema at all.
+                        if let Some(first_batch) = log_batches.data_batches.first() {
+                            let extra_fields: Vec<_> = first_batch
+                                .schema()
+                                .fields()
+                                .iter()
+                                .filter(|f| full_schema.field_with_name(f.name()).is_err())
+                                .cloned()
+                                .collect();
+                            if !extra_fields.is_empty() {
+                                let mut all_fields: Vec<_> =
+                                    full_schema.fields().iter().cloned().collect();
+                                all_fields.extend(extra_fields);
+                                full_schema = Schema::new(all_fields);
+                            }
+                        }
+
+                        Arc::new(full_schema)
+                    }
+                    None => log_batches
+                        .data_batches
+                        .first()
+                        .map(|b| b.schema())
+                        .ok_or_else(|| {
+                            CoreError::FileGroup(
+                                "Log-only file group produced no data batches".to_string(),
+                            )
+                        })?,
+                };
+
+                log::warn!(
+                    "FileGroupReader log-only: final target schema ({} cols): [{}]",
+                    schema.fields().len(),
+                    schema.fields().iter().map(|f| format!("{}:{}", f.name(), f.data_type())).collect::<Vec<_>>().join(", ")
+                );
+
+                // Project log data batches to the table schema by name. This corrects any
+                // AVRO-vs-Parquet column ordering differences so downstream consumers
+                // (e.g. Velox) see columns in the expected positions with the expected types.
+                let log_batches = if let Some(first) = log_batches.data_batches.first() {
+                    log::warn!(
+                        "FileGroupReader log-only: AVRO batch schema ({} cols): [{}]",
+                        first.schema().fields().len(),
+                        first.schema().fields().iter().map(|f| format!("{}:{}", f.name(), f.data_type())).collect::<Vec<_>>().join(", ")
+                    );
+                    let needs_projection = first.schema().fields().len() != schema.fields().len()
+                        || first.schema().fields().iter().zip(schema.fields().iter()).any(
+                            |(a, b)| a.data_type() != b.data_type() || a.name() != b.name(),
+                        );
+                    if needs_projection {
+                        let indices: Vec<usize> = schema
+                            .fields()
+                            .iter()
+                            .map(|f| {
+                                first
+                                    .schema()
+                                    .index_of(f.name())
+                                    .map_err(CoreError::ArrowError)
+                            })
+                            .collect::<Result<_>>()?;
+                        let mut projected = RecordBatches::new_with_capacity(
+                            log_batches.num_data_batches(),
+                            log_batches.num_delete_batches(),
+                        );
+                        for batch in &log_batches.data_batches {
+                            projected.push_data_batch(
+                                batch.project(&indices).map_err(CoreError::ArrowError)?,
+                            );
+                        }
+                        for (batch, ts) in log_batches.delete_batches {
+                            projected.push_delete_batch(batch, ts);
+                        }
+                        projected
+                    } else {
+                        log_batches
+                    }
+                } else {
+                    log_batches
+                };
+
+                let merger = RecordMerger::new(schema, self.hudi_configs.clone());
+                return merger.merge_record_batches(log_batches);
+            }
+
             let base_batch = self
                 .read_file_slice_by_base_file_path(base_file_path)
                 .await?;
             let schema = base_batch.schema();
+
+            // When column projection is active, the base batch may have fewer columns
+            // than the log batches (which are always read in full from the log scanner).
+            // Project each log data batch down to the base schema so concat_batches
+            // receives uniformly-schemaed inputs.
+            let log_batches = if let Some(first) = log_batches.data_batches.first() {
+                if first.num_columns() > schema.fields().len() {
+                    let indices: Vec<usize> = schema
+                        .fields()
+                        .iter()
+                        .map(|f| {
+                            first
+                                .schema()
+                                .index_of(f.name())
+                                .map_err(CoreError::ArrowError)
+                        })
+                        .collect::<Result<_>>()?;
+                    let mut projected = RecordBatches::new_with_capacity(
+                        log_batches.num_data_batches(),
+                        log_batches.num_delete_batches(),
+                    );
+                    for batch in &log_batches.data_batches {
+                        projected
+                            .push_data_batch(batch.project(&indices).map_err(CoreError::ArrowError)?);
+                    }
+                    for (batch, ts) in log_batches.delete_batches {
+                        projected.push_delete_batch(batch, ts);
+                    }
+                    projected
+                } else {
+                    log_batches
+                }
+            } else {
+                log_batches
+            };
+
             let num_data_batches = log_batches.num_data_batches() + 1;
             let num_delete_batches = log_batches.num_delete_batches();
             let mut all_batches =

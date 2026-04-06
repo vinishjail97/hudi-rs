@@ -502,7 +502,7 @@ mod tests {
             assert_eq!(file_group.file_slices.len(), 1);
             let (_, file_slice) = file_group.file_slices.iter().next().unwrap();
             assert_eq!(
-                file_slice.base_file.file_name(),
+                file_slice.base_file.as_ref().unwrap().file_name(),
                 "file-id-0_0-7-24_20240418173200000.parquet"
             );
             assert_eq!(file_slice.log_files.len(), 2);
@@ -586,7 +586,7 @@ mod tests {
             let file_group = file_groups.iter().next().unwrap();
             let file_slice = file_group.file_slices.values().next().unwrap();
             assert_eq!(
-                file_slice.base_file.completion_timestamp,
+                file_slice.base_file.as_ref().unwrap().completion_timestamp,
                 Some("20240418173210000".to_string())
             );
         }
@@ -976,7 +976,7 @@ mod tests {
             // Verify completion timestamp was set
             let file_slice = file_groups[0].file_slices.values().next().unwrap();
             assert_eq!(
-                file_slice.base_file.completion_timestamp,
+                file_slice.base_file.as_ref().unwrap().completion_timestamp,
                 Some("20240418173210000".to_string())
             );
         }

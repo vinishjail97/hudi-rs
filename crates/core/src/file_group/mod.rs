@@ -96,6 +96,29 @@ impl FileGroup {
         Ok(file_group)
     }
 
+    /// Create a new log-only [FileGroup] from a list of log file names.
+    ///
+    /// Used when a MOR file group has delta log files but no base Parquet file yet
+    /// (i.e., before the first compaction). The file group id is parsed from the
+    /// first log file name.
+    pub fn new_from_log_file_names(
+        log_file_names: &[&str],
+        partition_path: &str,
+    ) -> Result<Self> {
+        let first = log_file_names.first().ok_or_else(|| {
+            CoreError::FileGroup("Cannot create log-only FileGroup: no log files provided".to_string())
+        })?;
+        let log_file = LogFile::from_str(first)?;
+        let file_id = log_file.file_id.clone();
+        let mut fg = Self::new(file_id, partition_path.to_string());
+        // Insert a sentinel log-only slice keyed by "" so that range lookups
+        // (`..=any_timestamp`) find it regardless of the log file timestamps.
+        fg.file_slices
+            .insert(String::new(), FileSlice::new_log_only(partition_path.to_string()));
+        fg.add_log_files_from_names(log_file_names)?;
+        Ok(fg)
+    }
+
     /// Merge another file group into this one.
     ///
     /// The file slices are merged by their keys (commit_timestamp / base instant time).
@@ -192,7 +215,6 @@ impl FileGroup {
     /// - **Without completion_timestamp (v6 tables)**: Use exact matching or range lookup
     ///   based on log timestamp.
     ///
-    /// TODO: support adding log files to file group without base files.
     pub fn add_log_file(&mut self, log_file: LogFile) -> Result<&Self> {
         // Validate file_id matches
         if log_file.file_id != self.file_id {
@@ -204,7 +226,9 @@ impl FileGroup {
 
         // If log file has completion_timestamp, use completion-time-based association
         // File slices are keyed by commit_timestamp (base instant time)
-        // Find the largest base instant time <= log's completion time
+        // Find the largest base instant time <= log's completion time.
+        // Note: log-only slices are keyed by "" which sorts before any real timestamp,
+        // so the range lookup will find the sentinel slice when no base-file slices exist.
         if let Some(log_completion_time) = &log_file.completion_timestamp {
             // Find file slice with largest base instant time
             // (commit_timestamp) <= log's completion time
@@ -217,10 +241,7 @@ impl FileGroup {
                 return Ok(self);
             }
 
-            // No file slice with base instant time <= log's completion time found.
-            // This means the log file's completion timestamp is earlier than all base files'
-            // commit timestamps, or the FileGroup has no base files.
-            // TODO: Support log files without base files in a future priority task.
+            // No file slice found (not even a log-only sentinel).
             return Err(CoreError::FileGroup(format!(
                 "No suitable FileSlice found for log file with completion_timestamp {} in File Group {}. \
                 Either the log file's completion timestamp is earlier than all base files' commit timestamps, \
@@ -310,6 +331,8 @@ mod tests {
             fg.get_file_slice_as_of("20240402123035233")
                 .unwrap()
                 .base_file
+                .as_ref()
+                .unwrap()
                 .commit_timestamp,
             "20240402123035233"
         );
@@ -419,11 +442,9 @@ mod tests {
         assert!(fg.file_slices.contains_key("20250113230302428"));
         // Verify we can get the file slice using request timestamp
         let slice = fg.get_file_slice_as_of("20250113230302428").unwrap();
-        assert_eq!(slice.base_file.commit_timestamp, "20250113230302428");
-        assert_eq!(
-            slice.base_file.completion_timestamp,
-            Some("20250113230310000".to_string())
-        );
+        let bf = slice.base_file.as_ref().unwrap();
+        assert_eq!(bf.commit_timestamp, "20250113230302428");
+        assert_eq!(bf.completion_timestamp, Some("20250113230310000".to_string()));
     }
 
     #[test]
@@ -719,5 +740,41 @@ mod tests {
                 .to_string()
                 .contains("No suitable FileSlice found for log file with timestamp")
         );
+    }
+
+    #[test]
+    fn test_log_only_file_group_construction() {
+        // Single log file — v8+ style name with completion timestamp encoded
+        let log_names = [
+            ".29f30b41-a58c-47f7-b7d9-7bb980a027d2-0_20260401221751427.log.1_0-82-166",
+        ];
+        let fg = FileGroup::new_from_log_file_names(&log_names, "2023/01/01").unwrap();
+        assert_eq!(fg.file_id, "29f30b41-a58c-47f7-b7d9-7bb980a027d2-0");
+        // Sentinel log-only slice is keyed by ""
+        assert!(fg.file_slices.contains_key(""));
+        let (_, slice) = fg.file_slices.iter().next().unwrap();
+        assert!(slice.base_file.is_none());
+        assert_eq!(slice.log_files.len(), 1);
+        assert_eq!(slice.file_id(), "29f30b41-a58c-47f7-b7d9-7bb980a027d2-0");
+        assert_eq!(slice.base_file_relative_path().unwrap(), "");
+    }
+
+    #[test]
+    fn test_log_only_file_group_multiple_log_files() {
+        let log_names = [
+            ".29f30b41-a58c-47f7-b7d9-7bb980a027d2-0_20260401221751427.log.1_0-82-166",
+            ".29f30b41-a58c-47f7-b7d9-7bb980a027d2-0_20260401221751427.log.2_0-100-200",
+        ];
+        let fg = FileGroup::new_from_log_file_names(&log_names, "").unwrap();
+        let (_, slice) = fg.file_slices.iter().next().unwrap();
+        assert!(slice.base_file.is_none());
+        assert_eq!(slice.log_files.len(), 2);
+    }
+
+    #[test]
+    fn test_log_only_file_group_empty_names_error() {
+        let result = FileGroup::new_from_log_file_names(&[], "partition");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no log files provided"));
     }
 }

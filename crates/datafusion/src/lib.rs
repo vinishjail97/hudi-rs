@@ -336,7 +336,9 @@ impl TableProvider for HudiDataSource {
                 })?;
                 let url = join_url_segments(&base_url, &[relative_path.as_str()])
                     .map_err(|e| Execution(format!("Failed to join URL segments: {e:?}")))?;
-                let size = f.base_file.file_metadata.as_ref().map_or(0, |m| m.size);
+                let size = f.base_file.as_ref()
+                    .and_then(|bf| bf.file_metadata.as_ref())
+                    .map_or(0, |m| m.size);
                 let partitioned_file = PartitionedFile::new(url.path(), size);
                 parquet_file_group_vec.push(partitioned_file);
             }

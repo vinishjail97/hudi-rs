@@ -1262,7 +1262,7 @@ mod tests {
         );
         let file_slice = file_slices[0];
         assert_eq!(
-            file_slice.base_file.file_name(),
+            file_slice.base_file.as_ref().unwrap().file_name(),
             "92e64357-e4d1-4639-a9d3-c3535829d0aa-0_1-53-79_20250121000647668.parquet"
         );
         assert_eq!(

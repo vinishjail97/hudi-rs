@@ -23,6 +23,7 @@ use crate::config::error::Result as ConfigResult;
 use crate::config::table::HudiTableConfig::{
     PopulatesMetaFields, PrecombineField, RecordMergeStrategy,
 };
+use crate::error::CoreError;
 use crate::file_group::record_batches::RecordBatches;
 use crate::merge::RecordMergeStrategyValue;
 use crate::merge::ordering::{MaxOrderingInfo, process_batch_for_max_orderings};
@@ -34,7 +35,7 @@ use crate::record::{
 };
 use crate::util::arrow::ColumnAsArray;
 use crate::util::arrow::lexsort_to_indices;
-use arrow_array::{BooleanArray, RecordBatch};
+use arrow_array::{Array, BooleanArray, RecordBatch, StringArray};
 use arrow_row::{OwnedRow, Row};
 use arrow_schema::SchemaRef;
 use arrow_select::take::take_record_batch;
@@ -92,6 +93,84 @@ impl RecordMerger {
         match merge_strategy {
             RecordMergeStrategyValue::AppendOnly => {
                 record_batches.concat_data_batches(self.schema.clone())
+            }
+            RecordMergeStrategyValue::CommitTimeOrdering => {
+                let data_batch = record_batches.concat_data_batches(self.schema.clone())?;
+                let num_records = data_batch.num_rows();
+                if num_records == 0 {
+                    return Ok(data_batch);
+                }
+
+                // Sort by (record_key, commit_seqno) descending — no precombine field needed
+                let key_array = data_batch.get_array(MetaField::RecordKey.as_ref())?;
+                let commit_seqno_array = data_batch.get_array(MetaField::CommitSeqno.as_ref())?;
+                let desc_indices = lexsort_to_indices(&[key_array, commit_seqno_array], true);
+
+                // Build delete key → max delete instant time (no ordering field needed)
+                let delete_max_times: HashMap<String, String> =
+                    if record_batches.num_delete_rows() == 0 {
+                        HashMap::new()
+                    } else {
+                        let mut map: HashMap<String, String> = HashMap::new();
+                        for (batch, instant_time) in &record_batches.delete_batches {
+                            let key_col = batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .ok_or_else(|| {
+                                    CoreError::LogBlockError(
+                                        "Expected StringArray for delete recordKey".to_string(),
+                                    )
+                                })?;
+                            for i in 0..batch.num_rows() {
+                                if key_col.is_null(i) {
+                                    continue;
+                                }
+                                let key = key_col.value(i).to_string();
+                                let entry =
+                                    map.entry(key).or_insert_with(|| instant_time.clone());
+                                if instant_time > entry {
+                                    *entry = instant_time.clone();
+                                }
+                            }
+                        }
+                        map
+                    };
+
+                // Extract string arrays for record key and commit time comparisons
+                let record_key_arr =
+                    data_batch.get_string_array(MetaField::RecordKey.as_ref())?;
+                let commit_time_arr =
+                    data_batch.get_string_array(MetaField::CommitTime.as_ref())?;
+
+                // Build keep mask: keep first occurrence per key (desc commit seqno order),
+                // filtered by delete blocks with a more recent commit time.
+                let mut keep_mask_builder = BooleanArray::builder(num_records);
+                let mut last_key: Option<String> = None;
+                for i in 0..num_records {
+                    let idx = desc_indices.value(i) as usize;
+                    let curr_key = record_key_arr.value(idx).to_string();
+
+                    let first_seen = last_key.as_deref() != Some(&curr_key);
+                    if first_seen {
+                        last_key = Some(curr_key.clone());
+                        let should_keep = match delete_max_times.get(&curr_key) {
+                            Some(delete_time) => {
+                                // Keep record only if there is no more-recent delete
+                                let record_commit_time = commit_time_arr.value(idx);
+                                delete_time.as_str() <= record_commit_time
+                            }
+                            None => true,
+                        };
+                        keep_mask_builder.append_value(should_keep);
+                    } else {
+                        keep_mask_builder.append_value(false);
+                    }
+                }
+
+                let keep_mask = keep_mask_builder.finish();
+                let keep_indices = arrow::compute::filter(&desc_indices, &keep_mask)?;
+                Ok(take_record_batch(&data_batch, &keep_indices)?)
             }
             RecordMergeStrategyValue::OverwriteWithLatest => {
                 let data_batch = record_batches.concat_data_batches(self.schema.clone())?;
