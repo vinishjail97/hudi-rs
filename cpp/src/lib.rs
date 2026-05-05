@@ -17,6 +17,7 @@
  * under the License.
  */
 pub mod context;
+pub mod scan_spec_ffi;
 mod util;
 
 /// Re-export core types for integration tests and downstream consumers.
@@ -166,6 +167,12 @@ mod ffi {
         /// internal buffers) and deallocates the struct itself through Rust's
         /// allocator.  The caller must not use `ptr` after this call.
         unsafe fn hudi_free_arrow_stream(ptr: *mut ArrowArrayStream);
+
+        /// Test-only Phase 1 helper: parse a ScanSpec JSON blob (produced by
+        /// `velox::connector::hive::hudi::scanSpecToJson`) and print
+        /// `[SCANSPEC-FFI]` lines on stderr.  Returns `Err` on parse or
+        /// version failures.
+        fn parse_and_print_scan_spec(json: String) -> Result<()>;
     }
 }
 
@@ -487,6 +494,12 @@ impl HoodieFileGroupReader {
 /// used after this call.
 unsafe fn hudi_free_arrow_stream(ptr: *mut ffi::ArrowArrayStream) {
     unsafe { free_arrow_stream(ptr) };
+}
+
+/// CXX entry point for the Phase 1 ScanSpec roundtrip; delegates to
+/// [`scan_spec_ffi::parse_and_print_scan_spec`].
+pub fn parse_and_print_scan_spec(json: String) -> std::result::Result<(), String> {
+    scan_spec_ffi::parse_and_print_scan_spec(json)
 }
 
 /// Convert an Avro schema JSON string to an Arrow Schema.
