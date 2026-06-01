@@ -85,7 +85,7 @@ pub fn records_to_batch(
 /// - Map entries field: Avro uses "key_value", Parquet uses column name
 ///
 /// Rebuilds each column's ArrayData with the target schema's field metadata.
-fn reconcile_batch_to_schema(batch: &RecordBatch, target_schema: &SchemaRef) -> RecordBatch {
+pub(crate) fn reconcile_batch_to_schema(batch: &RecordBatch, target_schema: &SchemaRef) -> RecordBatch {
     let columns: Vec<ArrayRef> = target_schema
         .fields()
         .iter()
