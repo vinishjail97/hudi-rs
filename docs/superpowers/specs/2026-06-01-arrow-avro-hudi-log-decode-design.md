@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-01
 **Status:** Approved (pre-implementation)
-**Branch:** `feat/arrow-avro-log-decode` (hudi-rs) + `feat/avro-body-decoder` off tag `57.0.0` (arrow-rs fork)
+**Branch:** `feat/arrow-avro-log-decode` (hudi-rs) + `feat/avro-body-decoder` off tag `57.3.1` (arrow-rs fork)
 
 ## 1. Goal
 
@@ -20,7 +20,7 @@ logs, read through `HoodieFileGroupReader`) pass green, and logs prove the new p
 - The `BlockType::AvroData` branch of `Decoder::decode_avro_record_content`
   (`crates/core/src/file_group/log_file/content.rs:100`) — the single chokepoint both
   readers funnel through.
-- A minimal, additive public API in the `arrow-avro` crate (forked at tag `57.0.0`).
+- A minimal, additive public API in the `arrow-avro` crate (forked at tag `57.3.1`).
 
 **Out of scope**
 - Delete blocks, Parquet, HFile branches.
@@ -34,9 +34,10 @@ logs, read through `HoodieFileGroupReader`) pass green, and logs prove the new p
 - **Single chokepoint:** both `HoodieFileGroupReader` (target) and `FileGroupReader`
   (legacy) reach Avro→Arrow via `Decoder::decode_avro_record_content`. A body-only swap
   there hits the target and leaves legacy compiling.
-- **Version match:** `arrow-avro` at tag `57.0.0` carries the internals we need
-  (`RecordDecoder`, `AvroFieldBuilder`, `AvroField::data_type`, `AvroSchema`) and its
-  workspace arrow is `57.0.0`, matching hudi-rs's `arrow = "57"`.
+- **Version match:** `arrow-avro` at tag `57.3.1` carries the internals we need
+  (`RecordDecoder`, `AvroFieldBuilder`, `AvroField::data_type`, `AvroSchema` — byte-for-byte
+  the same as 57.0.0) and its workspace arrow is `57.3.1`, semver-compatible with hudi-rs's
+  `arrow = "57"` (`^57`). See §3.1 for version rationale.
 - **Dependency hazard:** `arrow-avro`'s arrow deps are `workspace = true` → local paths.
   A plain path-dep would give cargo *two* `arrow-array` crates (crates.io 57 vs
   local-path 57) and `RecordBatch` would not type-unify. Fixed via `[patch.crates-io]`
@@ -46,6 +47,27 @@ logs, read through `HoodieFileGroupReader`) pass green, and logs prove the new p
   `reconcile_batch_to_schema` (`reader/buffer/row_extraction.rs:88`) already bridges
   "Avro-derived schemas (from log files) vs Parquet-derived schemas" via name lookup +
   `arrow_cast`. This is the reuse vehicle for divergence handling.
+
+### 3.1 Version rationale (pin 57.3.1 now, track 58.3.0 later)
+
+| | Version | Arrow workspace | Compatible with hudi `arrow = "57"` (`^57`) |
+|---|---|---|---|
+| Latest overall | 58.3.0 | 58.3.0 | No — would force an arrow-58 bump across all of hudi-rs |
+| Latest on the 57 line | **57.3.1** (chosen) | 57.3.1 | Yes |
+
+- **Within the 57 line (57.0.0 → 57.3.1):** almost entirely **writer** changes plus dep
+  bumps; the **reader** engine moved ~7 lines in `record.rs` / ~8 in `codec.rs`. For our
+  decode path, 57.0.0 and 57.3.1 are effectively identical, so the `AvroBodyDecoder` patch
+  applies unchanged.
+- **58-only reader fixes we forgo** (need arrow 58): #9328 union resolution, #9237 schema
+  resolution, #9605 skipper for resolved named records, #9280 configurable timestamp tz,
+  #9291 additional Arrow types. The correctness fixes are **all on the schema-resolution
+  path** — they fire only when a *reader schema differs from the writer schema*
+  (evolution / projection). Our design decodes with the **writer schema only** and
+  reconciles downstream by name + `arrow_cast`, so it does not exercise that path.
+- **Follow-up:** track 58.3.0. The trigger to move (and bump hudi to arrow 58) is if we
+  ever replace the downstream reconcile with arrow-avro's native reader-schema / projection
+  resolution — that is where the 58-era reader fixes matter.
 
 ## 4. New `arrow-avro` public API (additive, ~25 LOC in `reader/mod.rs`)
 
@@ -145,8 +167,8 @@ arrow-select = { path = "../arrow-rs/arrow-select" }
 # extend to other arrow-* crates if the build still reports duplicates
 ```
 
-The local arrow-rs checkout sits on a branch off tag `57.0.0` (identical to crates.io
-57.0.0), so behavior is unchanged; the patch only collapses the two sources into one.
+The local arrow-rs checkout sits on a branch off tag `57.3.1` (identical to crates.io
+57.3.1), so behavior is unchanged; the patch only collapses the two sources into one.
 
 ## 7. Removing old conversion from the fg-read **data** path
 
@@ -190,7 +212,7 @@ that case. No speculative generality is built ahead of a failing test.
 
 ## 11. Work breakdown (for the implementation plan)
 
-1. arrow-rs fork: branch off `57.0.0`, add `AvroBodyDecoder` to `arrow-avro/src/reader/mod.rs`, build it.
+1. arrow-rs fork: branch off `57.3.1`, add `AvroBodyDecoder` to `arrow-avro/src/reader/mod.rs`, build it.
 2. hudi-rs: add `arrow-avro` dep + `[patch.crates-io]`; confirm `cargo build` unifies arrow.
 3. hudi-rs: promote `reconcile_batch_to_schema` to `pub(crate)`.
 4. hudi-rs: rewrite `decode_avro_record_content` body (engine swap + logging + oracle + reconcile).
