@@ -18,16 +18,20 @@
  */
 use crate::Result;
 use crate::avro_to_arrow::arrow_array_reader::AvroArrowArrayReader;
+use crate::avro_to_arrow::to_arrow_schema;
 use crate::error::CoreError;
-use crate::file_group::log_file::avro::AvroDataBlockContentReader;
 use crate::file_group::log_file::log_block::{
     BlockMetadataKey, BlockType, LogBlockContent, LogBlockVersion,
 };
+use crate::file_group::reader::buffer::row_extraction::reconcile_batch_to_schema;
 use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::schema::delete::{avro_schema_for_delete_record, avro_schema_for_delete_record_list};
 use apache_avro::{Schema as AvroSchema, from_avro_datum};
+use arrow_avro::reader::AvroBodyDecoder;
+use arrow_avro::schema::AvroSchema as ArrowAvroSchema;
+use arrow_schema::SchemaRef;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use std::collections::HashMap;
@@ -104,26 +108,106 @@ impl Decoder {
     ) -> Result<RecordBatches> {
         Decoder::validate_log_block_version(&mut reader)?;
 
-        let writer_schema = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
+        let writer_schema_json = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
             CoreError::LogBlockError("Schema not found in block header".to_string())
         })?;
-        let writer_schema = Arc::new(AvroSchema::parse_str(writer_schema)?);
 
+        // Record count (big-endian u32) — bespoke Hudi framing.
         let mut record_count_buf = [0u8; 4];
         reader.read_exact(&mut record_count_buf)?;
         let record_count = u32::from_be_bytes(record_count_buf);
 
-        let record_content_reader =
-            AvroDataBlockContentReader::new(reader, writer_schema.as_ref(), record_count);
-        let mut avro_arrow_array_reader =
-            AvroArrowArrayReader::try_new(record_content_reader, writer_schema.as_ref())?;
+        // Equivalence oracle: the exact Arrow schema the previous (apache-avro +
+        // AvroArrowArrayReader) path produced. We conform arrow-avro's output to this so
+        // downstream behavior is unchanged while the decode engine is swapped.
+        // Two parsers, once per block: apache_avro builds the oracle schema below;
+        // arrow_avro parses the same JSON inside AvroBodyDecoder::try_new.
+        let writer_schema = AvroSchema::parse_str(writer_schema_json)?;
+        let expected_schema: SchemaRef = Arc::new(to_arrow_schema(&writer_schema)?);
+
+        // New engine: arrow-avro decodes bare Avro record bodies straight into Arrow.
+        let mut decoder = AvroBodyDecoder::try_new(
+            &ArrowAvroSchema::new(writer_schema_json.clone()),
+            false, // utf8_view
+            false, // strict_mode
+        )
+        .map_err(CoreError::ArrowError)?;
+
+        log::info!(
+            "[arrow-avro] decoding Avro data block: {record_count} records (batch_size={})",
+            self.batch_size
+        );
+        let arrow_avro_schema = decoder.schema();
+        if arrow_avro_schema.as_ref() != expected_schema.as_ref() {
+            log::warn!(
+                "[arrow-avro] schema divergence; reconciling to oracle. arrow-avro={:?} expected={:?}",
+                arrow_avro_schema,
+                expected_schema
+            );
+        } else {
+            log::debug!("[arrow-avro] derived schema matches to_arrow_schema oracle");
+        }
+
+        // The remaining payload is the records region: [L0][datum0][L1][datum1]...
+        // It is already in the in-memory file buffer, so read_to_end is a cheap copy.
+        let mut payload = Vec::new();
+        reader.read_to_end(&mut payload)?;
+
         let mut batches =
             RecordBatches::new_with_capacity(record_count as usize / self.batch_size + 1, 0);
-        while let Some(batch) = avro_arrow_array_reader.next_batch(self.batch_size) {
-            let batch = batch.map_err(CoreError::ArrowError)?;
-            batches.push_data_batch(batch);
+        let mut pos = 0usize;
+        let mut rows_in_batch = 0usize;
+
+        for i in 0..record_count as usize {
+            // Per-record 4-byte big-endian length prefix.
+            let len_end = pos.checked_add(4).filter(|&e| e <= payload.len()).ok_or_else(|| {
+                CoreError::LogBlockError(format!("Truncated record length prefix for record {i}"))
+            })?;
+            let li = u32::from_be_bytes(payload[pos..len_end].try_into().unwrap()) as usize;
+            pos = len_end;
+            let body_end = pos.checked_add(li).filter(|&e| e <= payload.len()).ok_or_else(|| {
+                CoreError::LogBlockError(format!("Truncated datum for record {i}"))
+            })?;
+
+            // The slice is already trimmed to the exact body length, so the returned
+            // consumed-byte count is always `li`; we advance `pos` by `li` directly.
+            let _consumed = decoder
+                .decode(&payload[pos..body_end], 1)
+                .map_err(CoreError::ArrowError)?;
+            pos = body_end;
+            rows_in_batch += 1;
+
+            if rows_in_batch == self.batch_size {
+                Self::flush_decoder(&mut decoder, &expected_schema, &mut batches)?;
+                rows_in_batch = 0;
+            }
         }
+        if rows_in_batch > 0 {
+            Self::flush_decoder(&mut decoder, &expected_schema, &mut batches)?;
+        }
+
         Ok(batches)
+    }
+
+    /// Flush one batch from `decoder`, conforming it to `expected_schema` (by-name +
+    /// `arrow_cast`, via [`reconcile_batch_to_schema`]) so downstream sees the same schema
+    /// the previous decode path produced.
+    fn flush_decoder(
+        decoder: &mut AvroBodyDecoder,
+        expected_schema: &SchemaRef,
+        batches: &mut RecordBatches,
+    ) -> Result<()> {
+        let batch = decoder.flush().map_err(CoreError::ArrowError)?;
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let batch = if batch.schema().as_ref() == expected_schema.as_ref() {
+            batch
+        } else {
+            reconcile_batch_to_schema(&batch, expected_schema)
+        };
+        batches.push_data_batch(batch);
+        Ok(())
     }
 
     fn decode_parquet_record_content(&self, mut reader: impl Read) -> Result<RecordBatches> {
