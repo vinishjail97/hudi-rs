@@ -43,6 +43,7 @@ arrow-ord = { workspace = true }
 arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
+arrow-avro = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
 
