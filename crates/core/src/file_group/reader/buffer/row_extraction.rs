@@ -27,9 +27,9 @@
 //! - `records_to_batch` — reassemble BufferedRecords into a RecordBatch
 //! - `reconcile_batch_to_schema` — handle Avro/Parquet schema differences
 
-use crate::Result;
 use crate::error::CoreError;
 use crate::file_group::reader::buffered_record::BufferedRecord;
+use crate::Result;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 
@@ -44,15 +44,9 @@ pub fn slice_row(batch: &RecordBatch, row_index: usize) -> RecordBatch {
 ///
 /// Concatenates all single-row batches from the records into one batch.
 /// Records without data (deletes) are skipped.
-pub fn records_to_batch(
-    records: Vec<BufferedRecord>,
-    schema: SchemaRef,
-) -> Result<RecordBatch> {
+pub fn records_to_batch(records: Vec<BufferedRecord>, schema: SchemaRef) -> Result<RecordBatch> {
     // Mirrors Java: BufferedRecord.getRecord() unwraps from binary if needed
-    let batches: Vec<RecordBatch> = records
-        .iter()
-        .filter_map(|r| r.get_record())
-        .collect();
+    let batches: Vec<RecordBatch> = records.iter().filter_map(|r| r.get_record()).collect();
 
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(schema));
@@ -73,7 +67,7 @@ pub fn records_to_batch(
         .collect();
 
     let batch_refs: Vec<&RecordBatch> = reconciled.iter().collect();
-    arrow::compute::concat_batches(&schema, batch_refs.into_iter())
+    arrow::compute::concat_batches(&schema, batch_refs)
         .map_err(|e| CoreError::ReadFileSliceError(format!("Failed to concat record batches: {e}")))
 }
 
@@ -85,7 +79,10 @@ pub fn records_to_batch(
 /// - Map entries field: Avro uses "key_value", Parquet uses column name
 ///
 /// Rebuilds each column's ArrayData with the target schema's field metadata.
-pub(crate) fn reconcile_batch_to_schema(batch: &RecordBatch, target_schema: &SchemaRef) -> RecordBatch {
+pub(crate) fn reconcile_batch_to_schema(
+    batch: &RecordBatch,
+    target_schema: &SchemaRef,
+) -> RecordBatch {
     let columns: Vec<ArrayRef> = target_schema
         .fields()
         .iter()

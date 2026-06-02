@@ -16,7 +16,6 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::Result;
 use crate::avro_to_arrow::arrow_array_reader::AvroArrowArrayReader;
 use crate::avro_to_arrow::to_arrow_schema;
 use crate::error::CoreError;
@@ -28,7 +27,8 @@ use crate::file_group::reader::reader_context::ReaderContext;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::schema::delete::{avro_schema_for_delete_record, avro_schema_for_delete_record_list};
-use apache_avro::{Schema as AvroSchema, from_avro_datum};
+use crate::Result;
+use apache_avro::{from_avro_datum, Schema as AvroSchema};
 use arrow_avro::reader::AvroBodyDecoder;
 use arrow_avro::schema::AvroSchema as ArrowAvroSchema;
 use arrow_schema::SchemaRef;
@@ -140,9 +140,7 @@ impl Decoder {
         let arrow_avro_schema = decoder.schema();
         if arrow_avro_schema.as_ref() != expected_schema.as_ref() {
             log::warn!(
-                "[arrow-avro] schema divergence; reconciling to oracle. arrow-avro={:?} expected={:?}",
-                arrow_avro_schema,
-                expected_schema
+                "[arrow-avro] schema divergence; reconciling to oracle. arrow-avro={arrow_avro_schema:?} expected={expected_schema:?}"
             );
         } else {
             log::debug!("[arrow-avro] derived schema matches to_arrow_schema oracle");
@@ -160,14 +158,22 @@ impl Decoder {
 
         for i in 0..record_count as usize {
             // Per-record 4-byte big-endian length prefix.
-            let len_end = pos.checked_add(4).filter(|&e| e <= payload.len()).ok_or_else(|| {
-                CoreError::LogBlockError(format!("Truncated record length prefix for record {i}"))
-            })?;
+            let len_end = pos
+                .checked_add(4)
+                .filter(|&e| e <= payload.len())
+                .ok_or_else(|| {
+                    CoreError::LogBlockError(format!(
+                        "Truncated record length prefix for record {i}"
+                    ))
+                })?;
             let li = u32::from_be_bytes(payload[pos..len_end].try_into().unwrap()) as usize;
             pos = len_end;
-            let body_end = pos.checked_add(li).filter(|&e| e <= payload.len()).ok_or_else(|| {
-                CoreError::LogBlockError(format!("Truncated datum for record {i}"))
-            })?;
+            let body_end = pos
+                .checked_add(li)
+                .filter(|&e| e <= payload.len())
+                .ok_or_else(|| {
+                    CoreError::LogBlockError(format!("Truncated datum for record {i}"))
+                })?;
 
             // The slice is already trimmed to the exact body length, so the returned
             // consumed-byte count is always `li`; we advance `pos` by `li` directly.
