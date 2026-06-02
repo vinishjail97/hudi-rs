@@ -57,6 +57,7 @@ use std::sync::Arc;
 async fn create_configs_and_storage(
     table_path: &str,
 ) -> Result<(Arc<HudiConfigs>, Arc<Storage>)> {
+    let _ = env_logger::builder().is_test(true).try_init();
     let empty_opts: Vec<(&str, &str)> = vec![];
     let mut resolver = OptionResolver::new_with_options(table_path, empty_opts);
     resolver.resolve_options().await?;
